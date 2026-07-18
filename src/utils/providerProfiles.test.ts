@@ -31,6 +31,7 @@ const RESTORED_KEYS = [
   'OPENAI_API_BASE',
   'OPENAI_MODEL',
   'OPENAI_API_FORMAT',
+  'OPENAI_AZURE_STYLE',
   'OPENAI_AUTH_HEADER',
   'OPENAI_AUTH_SCHEME',
   'OPENAI_AUTH_HEADER_VALUE',
@@ -289,6 +290,22 @@ function buildCloudflareProfile(overrides: Partial<ProviderProfile> = {}): Provi
 }
 
 describe('applyProviderProfileToProcessEnv', () => {
+  test('applies Azure-style routing from a saved OpenAI-compatible profile', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        baseUrl: 'https://apim.contoso.example/azure-openai',
+        model: 'gpt-5.6-sol',
+        apiKey: 'azure-key',
+        azureStyle: true,
+      }),
+    )
+
+    expect(process.env.OPENAI_AZURE_STYLE).toBe('1')
+  })
+
   test('openai profile clears competing gemini/github flags', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
@@ -697,6 +714,7 @@ describe('applyProviderProfileToProcessEnv', () => {
   test('minimax profile ignores advanced OpenAI-compatible auth settings', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
+    process.env.OPENAI_AZURE_STYLE = '1'
 
     applyProviderProfileToProcessEnv(
       buildProfile({
@@ -720,6 +738,7 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.MINIMAX_API_KEY).toBe('minimax-live-key')
     expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
     expect(process.env.OPENAI_API_FORMAT).toBeUndefined()
+    expect(process.env.OPENAI_AZURE_STYLE).toBeUndefined()
     expect(process.env.OPENAI_AUTH_HEADER).toBeUndefined()
     expect(process.env.OPENAI_AUTH_SCHEME).toBeUndefined()
     expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()

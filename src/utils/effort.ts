@@ -6,7 +6,7 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/grow
 import { getAPIProvider } from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './model/antModels.js'
-import { supportsCodexReasoningEffort } from '../services/api/providerConfig.js'
+import { baseUrlSupportsResponsesAutoRoute, supportsCodexReasoningEffort } from '../services/api/providerConfig.js'
 import {
   ensureIntegrationsLoaded,
   getCatalogEntriesForRoute,
@@ -77,6 +77,8 @@ export type ReasoningControlContext = OpenAIShimReasoningSupportContext & {
   catalogEntries?: readonly ModelCatalogEntry[]
   modelDescriptors?: Readonly<Record<string, Pick<ModelDescriptor, 'capabilities' | 'reasoning'>>>
   openaiShimConfig?: Partial<OpenAIShimTransportConfig>
+  baseUrl?: string
+  processEnv?: NodeJS.ProcessEnv
 }
 
 const DEFAULT_REASONING_LEVELS: EffortLevel[] = ['low', 'medium', 'high']
@@ -319,14 +321,33 @@ function resolveCatalogReasoningMetadata(
 
   ensureIntegrationsLoaded()
   const normalizedModel = model.trim().split('?', 1)[0]!.trim().toLowerCase()
-  const entries = context?.catalogEntries ?? getCatalogEntriesForRoute(routeId)
-  const entry = entries.find(catalogEntry =>
+  const matchesModel = (catalogEntry: ModelCatalogEntry): boolean =>
     catalogEntry.apiName.trim().toLowerCase() === normalizedModel ||
     catalogEntry.id.trim().toLowerCase() === normalizedModel ||
     (catalogEntry.aliases ?? []).some(alias =>
       alias.trim().split('?', 1)[0]?.trim().toLowerCase() === normalizedModel,
-    ),
-  )
+    )
+
+  const entries = context?.catalogEntries ?? getCatalogEntriesForRoute(routeId)
+  let entry = entries.find(matchesModel)
+  const fallbackBaseUrl =
+    context?.baseUrl ?? context?.processEnv?.OPENAI_BASE_URL ?? process.env.OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE
+  if (
+    !entry &&
+    routeId === 'custom' &&
+    baseUrlSupportsResponsesAutoRoute(fallbackBaseUrl, context?.processEnv ?? process.env)
+  ) {
+    // Azure and regional/first-party OpenAI surfaces resolve to route 'custom'
+    // (their host is not a registered route; see resolveActiveRouteIdFromEnv),
+    // whose catalog is empty. Consult the openai vendor catalog by model name so
+    // reasoning models (gpt-5.6) carry their advertised metadata (default 'high',
+    // xhigh). Gate on baseUrlSupportsResponsesAutoRoute so this only fires on the
+    // same verified OpenAI/Azure surfaces the Responses auto-route uses, NOT
+    // arbitrary OpenAI-compatible gateways that also resolve to route 'custom' —
+    // those keep their pre-PR chat_completions behavior with no injected
+    // reasoning_effort default.
+    entry = getCatalogEntriesForRoute('openai').find(matchesModel)
+  }
 
   if (!entry) {
     return undefined

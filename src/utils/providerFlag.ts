@@ -344,6 +344,13 @@ export function applyProviderFlag(
   const model = parseModelFlag(args)
   const { defaultBaseUrl, defaultModel } = getRouteDefaults(provider)
 
+  // Azure-style routing changes both request paths and authentication. It is
+  // only meaningful for an explicit OpenAI/Azure configuration, so never let
+  // it follow a provider switch to another OpenAI-compatible endpoint.
+  if (provider !== 'openai') {
+    delete process.env.OPENAI_AZURE_STYLE
+  }
+
   switch (provider) {
     case 'anthropic': {
       // Default — clear any custom native proxy contract so this explicit
@@ -389,6 +396,7 @@ export function applyProviderFlag(
       delete process.env.OPENAI_API_BASE
       delete process.env.OPENAI_MODEL
       delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AZURE_STYLE
       delete process.env.OPENAI_AUTH_HEADER
       delete process.env.OPENAI_AUTH_SCHEME
       delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -459,6 +467,7 @@ export function applyProviderFlag(
       delete process.env.OPENAI_API_BASE
       delete process.env.OPENAI_MODEL
       delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AZURE_STYLE
       delete process.env.OPENAI_AUTH_HEADER
       delete process.env.OPENAI_AUTH_SCHEME
       delete process.env.OPENAI_AUTH_HEADER_VALUE

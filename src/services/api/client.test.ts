@@ -56,6 +56,7 @@ const originalEnv = {
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
   OPENAI_API_BASE: process.env.OPENAI_API_BASE,
   OPENAI_API_FORMAT: process.env.OPENAI_API_FORMAT,
+  OPENAI_AZURE_STYLE: process.env.OPENAI_AZURE_STYLE,
   OPENAI_AUTH_HEADER: process.env.OPENAI_AUTH_HEADER,
   OPENAI_AUTH_SCHEME: process.env.OPENAI_AUTH_SCHEME,
   OPENAI_AUTH_HEADER_VALUE: process.env.OPENAI_AUTH_HEADER_VALUE,
@@ -150,6 +151,7 @@ beforeEach(async () => {
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_API_BASE
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_MODEL
   delete process.env.MINIMAX_API_KEY
   delete process.env.XAI_API_KEY
@@ -194,6 +196,7 @@ afterEach(() => {
     restoreEnv('OPENAI_BASE_URL', originalEnv.OPENAI_BASE_URL)
     restoreEnv('OPENAI_API_BASE', originalEnv.OPENAI_API_BASE)
     restoreEnv('OPENAI_API_FORMAT', originalEnv.OPENAI_API_FORMAT)
+    restoreEnv('OPENAI_AZURE_STYLE', originalEnv.OPENAI_AZURE_STYLE)
     restoreEnv('OPENAI_AUTH_HEADER', originalEnv.OPENAI_AUTH_HEADER)
     restoreEnv('OPENAI_AUTH_SCHEME', originalEnv.OPENAI_AUTH_SCHEME)
     restoreEnv('OPENAI_AUTH_HEADER_VALUE', originalEnv.OPENAI_AUTH_HEADER_VALUE)
@@ -630,6 +633,7 @@ test('env-only MiniMax fallback drops stale OpenAI shim options', async () => {
   clearEnvForMiniMaxOnlyTest()
   process.env.MINIMAX_API_KEY = 'minimax-test-key'
   process.env.OPENAI_API_FORMAT = 'responses'
+  process.env.OPENAI_AZURE_STYLE = '1'
   process.env.OPENAI_AUTH_HEADER = 'api-key'
   process.env.OPENAI_AUTH_SCHEME = 'raw'
   process.env.OPENAI_AUTH_HEADER_VALUE = 'stale-header-value'
@@ -674,6 +678,7 @@ test('env-only MiniMax fallback drops stale OpenAI shim options', async () => {
   expect(capturedHeaders?.get('x-api-key')).toBe('minimax-test-key')
   expect(capturedHeaders?.get('api-key')).toBeNull()
   expect(process.env.OPENAI_API_FORMAT).toBeUndefined()
+  expect(process.env.OPENAI_AZURE_STYLE).toBeUndefined()
   expect(process.env.OPENAI_AUTH_HEADER).toBeUndefined()
   expect(process.env.OPENAI_AUTH_SCHEME).toBeUndefined()
   expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()
@@ -1586,27 +1591,27 @@ test('strips Anthropic-specific custom headers on providerOverride shim requests
 })
 
 test('providerOverride OpenAI gpt effort does not fall back to ambient provider', async () => {
+  let requestUrl = ''
   let requestBody: Record<string, unknown> | undefined
 
-  globalThis.fetch = (async (_input, init) => {
+  globalThis.fetch = (async (input, init) => {
+    requestUrl = String(input)
     requestBody = JSON.parse(String(init?.body))
 
     return new Response(
       JSON.stringify({
-        id: 'chatcmpl-provider-override-openai',
+        id: 'resp-provider-override-openai',
         model: 'gpt-5.4',
-        choices: [
+        output: [
           {
-            message: {
-              role: 'assistant',
-              content: 'ok',
-            },
-            finish_reason: 'stop',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
           },
         ],
         usage: {
-          prompt_tokens: 8,
-          completion_tokens: 3,
+          input_tokens: 8,
+          output_tokens: 3,
           total_tokens: 11,
         },
       }),
@@ -1636,8 +1641,193 @@ test('providerOverride OpenAI gpt effort does not fall back to ambient provider'
     stream: false,
   })
 
-  expect(requestBody?.reasoning_effort).toBe('xhigh')
+  // gpt-5.4 on api.openai.com auto-routes to the Responses API, where effort
+  // is nested as reasoning.effort rather than top-level reasoning_effort.
+  expect(requestUrl.endsWith('/responses')).toBe(true)
+  expect(requestBody?.reasoning).toEqual({ effort: 'xhigh', summary: 'auto' })
+  expect(requestBody).not.toHaveProperty('reasoning_effort')
 })
+
+test('normal OpenAI gpt effort uses catalog metadata', async () => {
+  let requestBody: Record<string, unknown> | undefined
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.GEMINI_API_KEY
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      id: 'resp-normal-openai', model: 'gpt-5.6-sol',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    model: 'gpt-5.6-sol',
+    effortValue: 'xhigh',
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(requestBody?.reasoning).toEqual({ effort: 'xhigh', summary: 'auto' })
+})
+
+test('auto-routed Azure gpt-5.4 and gpt-5.5 requests preserve selected effort', async () => {
+  const requestBodies: Record<string, unknown>[] = []
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.GEMINI_API_KEY
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)))
+    return new Response(JSON.stringify({
+      id: 'resp-azure-openai',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  for (const model of ['gpt-5.4', 'gpt-5.5']) {
+    const client = (await getAnthropicClient({
+      maxRetries: 0,
+      model,
+      effortValue: 'xhigh',
+    })) as unknown as ShimClient
+    await client.beta.messages.create({ model, messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+  }
+
+  expect(requestBodies).toEqual([
+    expect.objectContaining({ reasoning: { effort: 'xhigh', summary: 'auto' } }),
+    expect.objectContaining({ reasoning: { effort: 'xhigh', summary: 'auto' } }),
+  ])
+})
+
+test('OPENAI_API_BASE gateway does not inherit first-party GPT-5.6 effort metadata', async () => {
+  let requestUrl = ''
+  let requestBody: Record<string, unknown> | undefined
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.GEMINI_API_KEY
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_API_BASE = 'https://gateway.example/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+
+  globalThis.fetch = (async (input, init) => {
+    requestUrl = String(input)
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-gateway',
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    model: 'gpt-5.6-sol',
+    effortValue: 'xhigh',
+  })) as unknown as ShimClient
+  await client.beta.messages.create({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(requestUrl).toBe('https://gateway.example/v1/chat/completions')
+  expect(requestBody?.reasoning_effort).toBeUndefined()
+})
+
+test('providerOverride Azure gpt effort uses the override base for catalog metadata', async () => {
+  let requestBody: Record<string, unknown> | undefined
+  process.env.OPENAI_BASE_URL = 'https://gateway.example/v1'
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      id: 'resp-provider-override-azure', model: 'gpt-5.6-sol',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    effortValue: 'xhigh',
+    providerOverride: {
+      model: 'gpt-5.6-sol',
+      baseURL: 'https://myres.openai.azure.com/openai/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({ model: 'unused', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(requestBody?.reasoning).toEqual({ effort: 'xhigh', summary: 'auto' })
+})
+
+test('providerOverride does not inherit Azure-style routing from its parent', async () => {
+  let requestUrl = ''
+  let requestHeaders: Headers | undefined
+  let requestBody: Record<string, unknown> | undefined
+  process.env.OPENAI_AZURE_STYLE = '1'
+
+  globalThis.fetch = (async (input, init) => {
+    requestUrl = String(input)
+    requestHeaders = new Headers(init?.headers)
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-provider-override-gateway', model: 'gpt-5.6-sol',
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    providerOverride: {
+      model: 'gpt-5.6-sol',
+      baseURL: 'https://gateway.example/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({ model: 'unused', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(requestUrl).toBe('https://gateway.example/v1/chat/completions')
+  expect(requestHeaders?.get('authorization')).toBe('Bearer provider-test-key')
+  expect(requestHeaders?.get('api-key')).toBeNull()
+  expect(requestBody?.reasoning_effort).toBeUndefined()
+})
+
+test('providerOverride preserves an explicit responses format from its parent', async () => {
+  let requestUrl = ''
+  process.env.OPENAI_API_FORMAT = 'responses'
+
+  globalThis.fetch = (async (input, _init) => {
+    requestUrl = String(input)
+    return new Response(JSON.stringify({
+      id: 'resp-provider-override-gateway',
+      model: 'response-only-model',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    providerOverride: {
+      model: 'response-only-model',
+      baseURL: 'https://gateway.example/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({ model: 'unused', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(requestUrl).toBe('https://gateway.example/v1/responses')
+})
+
 test('providerOverride custom OpenAI-compatible gpt effort uses legacy support', async () => {
   let requestBody: Record<string, unknown> | undefined
 

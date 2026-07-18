@@ -415,6 +415,67 @@ function shouldUseGithubResponsesApi(model: string): boolean {
   return true
 }
 
+// GPT-5.4/5.5/5.6 (incl. sol/terra/luna suffixes) reject function tools +
+// reasoning_effort on /v1/chat/completions and must use /v1/responses. An
+// agent CLI always sends tools, so plain OpenAI/Azure users can't otherwise
+// reach these models. Matches gpt-5.4/5.5/5.6 with any non-mini/nano
+// suffix. -mini/-nano variants are excluded as unverified — they keep
+// chat/completions, and the OPENAI_API_FORMAT / profile apiFormat override
+// covers them if they turn out to need /responses. Two-digit minors
+// (gpt-5.10+) are deliberately unmatched: auto-routing unverified future
+// models is the exact risk this predicate exists to avoid. Bare gpt-5,
+// gpt-5-mini, gpt-4.x, o-series, and claude-* stay on chat/completions.
+export function modelRequiresResponsesApi(model: string): boolean {
+  const normalized = model.trim().toLowerCase().split('?', 1)[0] ?? ''
+  return /^gpt-5\.[4-6](?!\d)/.test(normalized) &&
+    !/(?:^|[-.])(?:mini|nano)(?:[-.]|$)/.test(normalized)
+}
+
+// The responses auto-route only fires for the OpenAI first-party surface
+// (the default base, api.openai.com, and its OpenAI-controlled subdomains
+// like the eu./us. regional endpoints) and Azure OpenAI hosts, where
+// /v1/responses is known to exist. Arbitrary OpenAI-compatible gateways
+// (OpenRouter-style proxies) often lack it, so those keep chat/completions
+// unless the user opts in via OPENAI_API_FORMAT / apiFormat.
+function isDefaultOrDirectOpenAIBaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl || baseUrl === DEFAULT_OPENAI_BASE_URL) return true
+  try {
+    const hostname = new URL(baseUrl).hostname.toLowerCase()
+    return hostname === 'api.openai.com' || hostname.endsWith('.api.openai.com')
+  } catch {
+    return false
+  }
+}
+
+// Azure-style endpoint detection shared by the responses auto-route gate and
+// the shim's URL/auth handling. OPENAI_AZURE_STYLE=1 forces Azure handling
+// for endpoints whose hostname would not otherwise match (APIM-fronted,
+// private link); hostname-based otherwise (not raw URL) to prevent bypass
+// via path segments like https://evil.com/cognitiveservices.azure.com/.
+export function isAzureStyleBaseUrl(
+  baseUrl: string | undefined,
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (isEnvTruthy(processEnv.OPENAI_AZURE_STYLE)) return true
+  if (!baseUrl) return false
+  try {
+    const hostname = new URL(baseUrl).hostname
+    return hostname.endsWith('.openai.azure.com') ||
+      hostname.endsWith('.cognitiveservices.azure.com') ||
+      hostname.endsWith('.services.ai.azure.com') ||
+      hostname.endsWith('.inference.ml.azure.com')
+  } catch {
+    return false
+  }
+}
+
+export function baseUrlSupportsResponsesAutoRoute(
+  baseUrl: string | undefined,
+  processEnv: NodeJS.ProcessEnv,
+): boolean {
+  return isDefaultOrDirectOpenAIBaseUrl(baseUrl) || isAzureStyleBaseUrl(baseUrl, processEnv)
+}
+
 export function isLocalProviderUrl(baseUrl: string | undefined): boolean {
   if (!baseUrl) return false
   try {
@@ -967,11 +1028,24 @@ export function resolveProviderRequest(options?: {
     isGithubMode
       ? undefined
       : parseOpenAICompatibleApiFormat(runtimeShimContext?.openaiShimConfig.requiredApiFormat)
+  // Precedence: explicit env/profile apiFormat (incl. chat_completions, the
+  // escape hatch) > catalog requiredApiFormat > this model+base predicate >
+  // shim default. The predicate fires only when nothing above resolved it, so
+  // an explicit format always wins over it.
+  const autoResponsesApiFormat =
+    !isGithubMode &&
+    explicitApiFormat === undefined &&
+    requiredApiFormat === undefined &&
+    modelRequiresResponsesApi(resolvedModel) &&
+    baseUrlSupportsResponsesAutoRoute(finalBaseUrl, processEnv)
+      ? ('responses' as const)
+      : undefined
   const requestedApiFormat =
     requiredApiFormat &&
     (explicitApiFormat === undefined || explicitApiFormat === 'chat_completions')
       ? requiredApiFormat
       : explicitApiFormat ??
+        autoResponsesApiFormat ??
         parseOpenAICompatibleApiFormat(runtimeShimContext?.openaiShimConfig.defaultApiFormat)
   const supportsRequestedApiFormat =
     (requestedApiFormat !== 'responses' && requestedApiFormat !== 'responses_compat') ||

@@ -82,9 +82,12 @@ import {
   getLocalFastPathConfig,
   getLocalProviderRetryBaseUrls,
   getGithubEndpointType,
+  baseUrlSupportsResponsesAutoRoute,
+  isAzureStyleBaseUrl,
   isDirectLocalOllamaEndpoint,
   isLikelyOllamaEndpoint,
   isLocalProviderUrl,
+  modelRequiresResponsesApi,
   resolveRuntimeCodexCredentials,
   resolveProviderRequest,
   shouldAttemptLocalToollessRetry,
@@ -3559,8 +3562,21 @@ class OpenAIShimMessages {
     let httpResponse: Response | undefined
 
     const promise = (async () => {
-      const request = resolveProviderRequest({ model: self.providerOverride?.model ?? params.model, baseUrl: self.providerOverride?.baseURL, reasoningEffortOverride: self.reasoningEffort })
-      const response = await self._doRequest(request, params, options)
+      // A provider override is a complete route, so it must not inherit an
+      // Azure-style escape hatch intended for the parent route.
+      const requestProcessEnv = self.providerOverride
+        ? {
+          ...process.env,
+          OPENAI_AZURE_STYLE: undefined,
+        }
+        : process.env
+      const request = resolveProviderRequest({
+        model: self.providerOverride?.model ?? params.model,
+        baseUrl: self.providerOverride?.baseURL,
+        reasoningEffortOverride: self.reasoningEffort,
+        processEnv: requestProcessEnv,
+      })
+      const response = await self._doRequest(request, params, options, requestProcessEnv)
       httpResponse = response
 
       if (params.stream) {
@@ -3672,6 +3688,7 @@ class OpenAIShimMessages {
     request: ReturnType<typeof resolveProviderRequest>,
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
+    requestProcessEnv: NodeJS.ProcessEnv = process.env,
   ): Promise<Response> {
     const githubEndpointType = getGithubEndpointType(request.baseUrl)
     const isGithubMode = isGithubModelsMode()
@@ -3776,13 +3793,14 @@ class OpenAIShimMessages {
       })
     }
 
-    return this._doOpenAIRequest(request, params, options)
+    return this._doOpenAIRequest(request, params, options, requestProcessEnv)
   }
 
   private async _doOpenAIRequest(
     request: ReturnType<typeof resolveProviderRequest>,
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
+    requestProcessEnv: NodeJS.ProcessEnv = process.env,
   ): Promise<Response> {
     // Local backends (llama.cpp, vLLM, Ollama, LM Studio, …) do not implement
     // the cloud-side caching/strict-validation behaviours that several of our
@@ -3799,7 +3817,7 @@ class OpenAIShimMessages {
       ? rawMessages
       : compressToolHistory(rawMessages, request.resolvedModel)
     const runtimeShimContext = resolveOpenAIShimRuntimeContext({
-      processEnv: process.env,
+      processEnv: requestProcessEnv,
       baseUrl: request.baseUrl,
       model: request.resolvedModel,
       treatAsLocal: isLocalProviderUrl(request.baseUrl),
@@ -3836,14 +3854,25 @@ class OpenAIShimMessages {
       routeId: runtimeShimContext.routeId,
       useRuntimeFallback: false,
       openaiShimConfig: shimConfig,
+      baseUrl: request.baseUrl,
+      processEnv: requestProcessEnv,
     })
+    // The explicit chat-completions escape hatch for GPT-5.4/5.5/5.6 must
+    // also omit reasoning effort: these models reject the tools + effort
+    // combination on that API surface.
+    const suppressReasoningForForcedChat =
+      effectiveTransport === 'chat_completions' &&
+      Array.isArray(params.tools) &&
+      params.tools.length > 0 &&
+      modelRequiresResponsesApi(request.resolvedModel) &&
+      baseUrlSupportsResponsesAutoRoute(request.baseUrl, requestProcessEnv)
     const reasoningRequestPlan = resolveOpenAIShimReasoningRequestPlan({
       model: request.resolvedModel,
-      requestedEffort: request.reasoning?.effort,
+      requestedEffort: suppressReasoningForForcedChat ? undefined : request.reasoning?.effort,
       requestThinkingType: (params.thinking as { type?: string } | undefined)?.type,
       defaultThinkingType: request.thinking?.type,
       thinkingRequestFormat: shimConfig.thinkingRequestFormat,
-      routeId: runtimeShimContext.routeId,
+      routeId: runtimeShimContext.routeId ?? 'custom',
       useRuntimeFallback: false,
       reasoningControl,
     })
@@ -3877,7 +3906,7 @@ class OpenAIShimMessages {
       body.max_completion_tokens = maxCompletionTokensValue
     }
 
-    if (params.stream && !isLikelyOllamaEndpoint(request.baseUrl)) {
+    if (params.stream && !isLocalProviderUrl(request.baseUrl)) {
       body.stream_options = { include_usage: true }
     }
 
@@ -4349,22 +4378,9 @@ class OpenAIShimMessages {
         new Headers(),
       )
     }
-    // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
-    // path segments like https://evil.com/cognitiveservices.azure.com/
-    let isAzure = isEnvTruthy(process.env.OPENAI_AZURE_STYLE)
-    if (!isAzure) {
-      try {
-        const { hostname } = new URL(request.baseUrl)
-        isAzure =
-          hostname.endsWith('.azure.com') &&
-          (hostname.includes('cognitiveservices') ||
-            hostname.includes('openai') ||
-            hostname.includes('services.ai') ||
-            hostname.includes('inference.ml'))
-      } catch {
-        /* malformed URL — not Azure */
-      }
-    }
+    // Reads live process.env by design; must agree with the responses
+    // auto-route gate's processEnv (both default to process.env today).
+    const isAzure = isAzureStyleBaseUrl(request.baseUrl, requestProcessEnv)
 
     let isBankr = false
     try {
@@ -4448,17 +4464,17 @@ class OpenAIShimMessages {
       // Azure Cognitive Services / Azure OpenAI require a deployment-specific
       // path and an api-version query parameter.
       if (isAzure) {
+        const normalizedBaseUrl = (baseUrl.split(/[?#]/, 1)[0] ?? baseUrl).replace(/\/+$/, '')
         const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
         const deployment = encodeURIComponent(request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o')
 
         // If base URL already contains /deployments/, use it as-is with api-version.
-        if (/\/deployments\//i.test(baseUrl)) {
-          const normalizedBase = baseUrl.replace(/\/+$/, '')
-          return `${normalizedBase}/chat/completions?api-version=${apiVersion}`
+        if (/\/deployments\//i.test(normalizedBaseUrl)) {
+          return `${normalizedBaseUrl}/chat/completions?api-version=${apiVersion}`
         }
 
         // Strip trailing /v1 or /openai/v1 if present, then build Azure path.
-        const normalizedBase = baseUrl
+        const normalizedBase = normalizedBaseUrl
           .replace(/\/(openai\/)?v1\/?$/, '')
           .replace(/\/+$/, '')
 
@@ -4466,6 +4482,31 @@ class OpenAIShimMessages {
       }
 
       return `${baseUrl}/chat/completions`
+    }
+
+    // Azure serves the Responses API only on the v1 surface
+    // ({resource}/openai/v1/responses — model in the request body, no
+    // api-version, no deployment-scoped form), so any Azure-style base is
+    // normalized to it: trailing /openai/v1, /v1, and
+    // /openai/deployments/<dep> segments are stripped until stable (bases
+    // can carry several, e.g. /openai/deployments/<dep>/openai/v1), then
+    // /openai/v1/responses is appended.
+    // https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses
+    const buildResponsesUrl = (baseUrl: string): string => {
+      const trimmedBase = baseUrl.replace(/\/+$/, '')
+      if (!isAzure) {
+        return `${trimmedBase}/responses`
+      }
+      let normalizedBase = (trimmedBase.split(/[?#]/, 1)[0] ?? trimmedBase).replace(/\/+$/, '')
+      for (;;) {
+        const stripped = normalizedBase
+          .replace(/\/(openai\/)?v1$/i, '')
+          .replace(/\/openai\/deployments\/[^/]+$/i, '')
+          .replace(/\/+$/, '')
+        if (stripped === normalizedBase) break
+        normalizedBase = stripped
+      }
+      return `${normalizedBase}/openai/v1/responses`
     }
 
     const localRetryBaseUrls = isLocal
@@ -4480,7 +4521,7 @@ class OpenAIShimMessages {
         return buildOllamaChatUrl(baseUrl)
       }
       return request.transport === 'responses' || request.transport === 'responses_compat'
-        ? `${baseUrl}/responses`
+        ? buildResponsesUrl(baseUrl)
         : buildChatCompletionsUrl(baseUrl)
     }
 
